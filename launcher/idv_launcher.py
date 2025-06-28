@@ -9,6 +9,7 @@ import time
 import multiprocessing
 import tempfile
 import msvcrt
+import shutil # 导入 shutil 模块用于目录操作
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -24,6 +25,7 @@ SETTINGS_FILE = "launcher_settings.json"
 # --- Windows API 常量和控制台控制函数 ---
 SW_HIDE = 0  # 隐藏窗口并激活另一个窗口。
 SW_SHOW = 5  # 激活窗口并以当前大小和位置显示。
+WM_CLOSE = 0x0010  # WM_CLOSE 消息，用于请求窗口关闭。
 
 # 加载所需的 Windows DLL
 user32 = ctypes.WinDLL("user32")
@@ -32,6 +34,7 @@ psapi = ctypes.WinDLL("psapi")  # 导入 psapi 以获取进程信息
 
 # 定义 OpenProcess 的访问权限
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # 允许查询进程信息以获取模块文件名
+PROCESS_TERMINATE = 0x0001 # 允许终止进程
 
 # 全局列表，用于存储找到的 HWNDs（窗口句柄）
 _enum_windows_callback_found_hwnds = []
@@ -82,14 +85,18 @@ user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.c
 user32.IsWindowVisible.argtypes = [ctypes.c_int]
 user32.GetWindowThreadProcessId.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_ulong)]
 user32.ShowWindow.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.PostMessageW.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+user32.PostMessageW.restype = ctypes.wintypes.BOOL
 
-# 定义 OpenProcess 的参数类型
+
+# 定义 OpenProcess 和 TerminateProcess 的参数类型
 kernel32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
 kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
-
-# 定义 CloseHandle 的参数类型
 kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
 kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+kernel32.TerminateProcess.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_uint]
+kernel32.TerminateProcess.restype = ctypes.wintypes.BOOL
+
 
 # 定义 GetModuleFileNameExW 的参数类型
 LPWSTR = ctypes.POINTER(ctypes.wintypes.WCHAR)
@@ -253,11 +260,14 @@ class GameLauncher(QWidget):
             self.exe_real_dir = os.path.dirname(sys.argv[0])
             print(f"GameLauncher: 检测到冻结模式。current_script_dir (临时): {self.current_script_dir}")
             print(f"GameLauncher: 检测到冻结模式。exe_real_dir (实际可执行文件路径): {self.exe_real_dir}")
+            # 保存 _MEIPASS 路径以备后续删除
+            self.mei_path_to_delete = self.current_script_dir
         else:
             # 如果是 Python 脚本，使用 __file__ 的目录作为当前脚本目录和实际可执行文件目录
             self.current_script_dir = os.path.dirname(os.path.abspath(__file__))
             self.exe_real_dir = self.current_script_dir
             print(f"GameLauncher: 检测到脚本模式。current_script_dir/exe_real_dir: {self.current_script_dir}")
+            self.mei_path_to_delete = None # 非冻结模式下没有 _MEI 路径需要删除
 
         # res_dir 仍然指向冻结时临时解压目录（sys._MEIPASS）中的 'res'
         self.res_dir = os.path.join(self.current_script_dir, 'res')
@@ -1535,7 +1545,7 @@ class GameLauncher(QWidget):
 
     def closeEvent(self, event):
         """
-        处理窗口关闭事件，终止所有后台进程。
+        处理窗口关闭事件，终止所有后台进程并尝试删除 PyInstaller 临时目录。
         """
         print("closeEvent: 主应用程序正在关闭，正在终止后台进程...")
         self._terminate_process(self.htmlget_process, "htmlget.py")
@@ -1543,12 +1553,61 @@ class GameLauncher(QWidget):
         if self.game_check_timer.isActive():
             self.game_check_timer.stop()
         self._terminate_process(self.game_process, "游戏")  # 终止实际游戏进程（如果存在）
-        # 如果核心程序进程是由启动器启动且仍在运行，则终止它
-        # 对于由 ShellExecuteW 启动的进程，我们没有 Popen 对象来终止。
-        # 我们只能依靠操作系统在主程序退出时进行清理。
-        # 这里只终止由 Popen 或 QProcess 明确跟踪的进程。
-        if isinstance(self.core_program_process, subprocess.Popen) and self.core_program_process.poll() is None:
-            self._terminate_process(self.core_program_process, "核心程序 (Popen)")
+
+        # 新增：尝试关闭核心程序
+        if sys.platform == "win32" and self.core_program_path:
+            core_exe_basename = os.path.basename(self.core_program_path)
+            print(f"closeEvent: 尝试查找并关闭核心程序 '{core_exe_basename}' 的窗口。")
+            # 重新查找所有核心程序窗口句柄
+            current_core_program_handles = _find_window_handle_by_exe_name(core_exe_basename, max_attempts=1, delay_s=0)
+
+            if current_core_program_handles:
+                print(f"closeEvent: 找到 {len(current_core_program_handles)} 个核心程序窗口句柄，尝试发送 WM_CLOSE 消息。")
+                for hwnd in current_core_program_handles:
+                    try:
+                        # 尝试发送 WM_CLOSE 消息，请求窗口优雅地关闭
+                        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                        print(f"closeEvent: 已向句柄 {hwnd} 发送 WM_CLOSE 消息。")
+                        # 额外等待一小段时间，让进程有机会响应 WM_CLOSE
+                        time.sleep(0.1)
+                        # 验证窗口是否已关闭
+                        if not user32.IsWindow(hwnd):
+                            print(f"closeEvent: 句柄 {hwnd} 对应的窗口已关闭。")
+                        else:
+                            print(f"closeEvent: 警告：句柄 {hwnd} 对应的窗口在发送 WM_CLOSE 后未关闭，尝试终止进程。")
+                            # 如果 WM_CLOSE 未关闭窗口，尝试获取 PID 并终止进程
+                            process_id = ctypes.c_ulong()
+                            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+                            if process_id.value != 0:
+                                p_handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, process_id.value)
+                                if p_handle:
+                                    kernel32.TerminateProcess(p_handle, 0) # 0 表示正常退出代码
+                                    kernel32.CloseHandle(p_handle)
+                                    print(f"closeEvent: 已终止进程 ID {process_id.value}。")
+                                else:
+                                    print(f"closeEvent: 错误：无法打开进程 ID {process_id.value} 的句柄以终止。")
+                            else:
+                                print(f"closeEvent: 错误：无法获取句柄 {hwnd} 的进程 ID。")
+
+                    except Exception as e:
+                        print(f"closeEvent: 关闭核心程序窗口 {hwnd} 时出错：{e}")
+            else:
+                print("closeEvent: 未找到核心程序窗口，无需关闭。")
+        else:
+            print("closeEvent: 非 Windows 平台或核心程序路径未设置，跳过关闭核心程序。")
+
+        # --- 尝试删除 PyInstaller 临时目录 ---
+        if self.mei_path_to_delete and os.path.isdir(self.mei_path_to_delete):
+            try:
+                print(f"closeEvent: 尝试删除 PyInstaller 临时目录: {self.mei_path_to_delete}")
+                shutil.rmtree(self.mei_path_to_delete)
+                print(f"closeEvent: PyInstaller 临时目录已成功删除: {self.mei_path_to_delete}")
+            except OSError as e:
+                print(f"closeEvent: 错误：无法删除 PyInstaller 临时目录 {self.mei_path_to_delete}。可能仍在被使用或权限不足：{e}")
+            except Exception as e:
+                print(f"closeEvent: 删除 PyInstaller 临时目录时发生未知错误 {self.mei_path_to_delete}：{e}")
+        else:
+            print("closeEvent: 未检测到 PyInstaller 临时目录需要删除或目录不存在。")
 
         # 释放单例锁
         release_single_instance_lock()  # 释放应用程序单例锁
@@ -1574,7 +1633,8 @@ def acquire_single_instance_lock():
         print("acquire_single_instance_lock: 非 Windows 平台，跳过单例锁检测。")
         return False
 
-    lock_file_path = os.path.join(tempfile.gettempdir(), LOCK_FILE_NAME)
+    # 单例锁文件路径依然使用程序可执行文件所在目录
+    lock_file_path = os.path.join(os.path.dirname(sys.argv[0]), LOCK_FILE_NAME)
     try:
         # 尝试以独占写入模式打开文件，并立即锁定它
         # buffering=0 禁用缓冲，确保立即写入。模式 'wb' 解决 'can't have unbuffered text I/O' 错误
@@ -1601,6 +1661,11 @@ def release_single_instance_lock():
         try:
             msvcrt.locking(_app_lock_file.fileno(), msvcrt.LK_UNLCK, 1)  # LK_UNLCK (解锁)
             _app_lock_file.close()
+            # 删除锁文件
+            lock_file_path = os.path.join(os.path.dirname(sys.argv[0]), LOCK_FILE_NAME)
+            if os.path.exists(lock_file_path):
+                os.remove(lock_file_path)
+                print(f"release_single_instance_lock: 锁文件 {lock_file_path} 已删除。")
             print("release_single_instance_lock: 单例锁已释放。")
         except Exception as e:
             print(f"release_single_instance_lock: 释放单例锁时出错: {e}")
@@ -1656,7 +1721,7 @@ if __name__ == '__main__':
     if acquire_single_instance_lock():
         # 如果已有实例正在运行，则显示消息并退出。
         # 由于 QApplication 已初始化，我们可以直接使用 QMessageBox。
-        QMessageBox.warning(None, "启动器已在运行", "游戏启动器已在运行。请检查您的任务栏或系统托盘。")
+        # QMessageBox.warning(None, "启动器已在运行", "游戏启动器已在运行。请检查您的任务栏或系统托盘。")
         print("__main__: 另一个实例正在运行。退出。")
         sys.exit(0)  # 正常退出
 
